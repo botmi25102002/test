@@ -23,6 +23,13 @@ router = APIRouter()
 CACHE_TTL = 300  # 5 minutes
 
 
+async def _invalidate_user_todo_cache(redis: RedisClient, user_id) -> None:
+    pattern = f"todos:list:{user_id}:*"
+    keys_to_delete = [key async for key in redis.client.scan_iter(match=pattern)]
+    if keys_to_delete:
+        await redis.client.delete(*keys_to_delete)
+
+
 @router.get("", response_model=TodoListResponse)
 async def list_todos(
     page: int = Query(1, ge=1),
@@ -34,7 +41,7 @@ async def list_todos(
     """Get paginated list of todos."""
     skip = (page - 1) * size
 
-    cache_key = "todos:list"
+    cache_key = f"todos:list:{current_user.id}:{page}:{size}"
 
     # Try to get from cache
     cached = await redis.get(cache_key)
@@ -79,9 +86,11 @@ async def create_new_todo(
     todo_data: TodoCreate,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
+    redis: RedisClient = Depends(get_redis),
 ):
     """Create a new todo item."""
     todo = await create_todo(db, todo_data, current_user.id)
+    await _invalidate_user_todo_cache(redis, current_user.id)
     return todo
 
 
@@ -97,6 +106,11 @@ async def get_todo(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Todo not found",
+        )
+    if todo.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this todo",
         )
 
     return todo
@@ -117,10 +131,15 @@ async def update_existing_todo(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Todo not found",
         )
+    if todo.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this todo",
+        )
 
     update_data = todo_data.model_dump()
 
-    if todo_data.completed:
+    if todo_data.completed is not None:
         todo.completed = todo_data.completed
 
     # Apply other updates
@@ -130,6 +149,7 @@ async def update_existing_todo(
         todo.description = update_data["description"]
 
     updated_todo = await update_todo(db, todo, {})
+    await _invalidate_user_todo_cache(redis, current_user.id)
 
     return updated_todo
 
@@ -148,7 +168,13 @@ async def delete_existing_todo(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Todo not found",
         )
+    if todo.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to access this todo",
+        )
 
     await delete_todo(db, todo)
+    await _invalidate_user_todo_cache(redis, current_user.id)
 
     return None
